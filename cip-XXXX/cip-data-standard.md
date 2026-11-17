@@ -76,6 +76,22 @@ The standard fixes what a consumer reads and how the consumer authenticates
 it. Request flows, the transport of disclosed contracts and signed payloads,
 pricing, entitlements and receipts belong to each distributor's product.
 
+> REVIEW(SM): I'd include the off-ledger part in this CIP. Without it, switching
+> distributors still requires a bespoke integration per distributor for fetching
+> the disclosed contracts and the signed payloads. So "switching distributor
+> doesn't require a new DAR file" is true, but you still need new backend code,
+> which undercuts the core promise of the standard.
+>
+> CIP-0056 solved the same problem with a standardized OpenAPI spec that every
+> registry serves, discovered via the CNS metadata key
+> `splice.lfdecentralizedtrust.org/registryUrls` (see
+> [Off-Ledger API Discovery and Access](../cip-0056/cip-0056.md#off-ledger-api-discovery-and-access)).
+> An analogous spec here would be small: list the feeds of a distributor, get the
+> latest publication of a feed as a disclosed contract, get the latest signed
+> payload of a feed, and get the `DistributorKey` as a disclosed contract.
+> Authentication and entitlements can stay distributor-specific; the standard
+> only needs to fix the endpoints and their response formats.
+
 ### Packages
 
 | Package | Content | Upgrade model |
@@ -91,6 +107,30 @@ verification and codecs therefore live in the codecs package,
 and `utils-v1` holds only types and small helpers. Every package
 depends only on `daml-prim`, `daml-stdlib` and other packages of the
 standard.
+
+> REVIEW(SM): the comment from my earlier review
+> ([here](https://github.com/kaikodata/canton-data-standard/pull/11/changes#r3860088698)) still stands,
+> and the 0.3.0 release demonstrates the problem: adding constructors to
+> `AnyValue` in `utils-v1` changed the package-ids of both interface packages,
+> and forced producers and consumers to upgrade in lock-step (see the 0.3.0
+> entry in the CHANGELOG). The "evolves by SCU" in the table above is therefore
+> misleading: any type referenced from an interface view is as frozen as the
+> interface itself.
+>
+> I strongly recommend reusing `Metadata` and `AnyValue` from
+> `splice-api-token-metadata-v1`. It's a tiny package without any token
+> semantics, it is already vetted on every validator, and given that this CIP
+> proposes to ship its packages in Splice, the dependency is natural. You'd also
+> get `ExtraArgs` and `ChoiceContext` for free (see my comment on `DistributorKey`
+> below).
+>
+> If you decide against that, then at least:
+> 1. copy the full `AnyValue` type to maximize optionality (see my comment on
+>    "Value types" for what's missing);
+> 2. rename `utils-v1` to e.g. `canton-data-standard-types-v1` and treat it like
+>    an interface package that is never upgraded; and
+> 3. move all code (`ToAnyValue`/`FromAnyValue`, `insertField`, `lookupField`,
+>    `sequenceOptional`, ...) into the `codecs` utility package.
 
 Package and module names above are those of the reference release. On
 inclusion in Splice, the packages take Splice's naming conventions for API
@@ -122,6 +162,20 @@ data Metadata = Metadata with
 maps nest, so structured payloads such as the constituents of an index or the
 term structure of a curve are expressible. Adding a constructor is a versioned
 change of the standard (see [Evolution](#evolution)).
+
+> REVIEW(SM): this is out of sync with the reference implementation, which is
+> at 0.3.0 and added `AVParty`, `AVInstrumentId`, `AVDate` and `AVNull` (plus
+> their tags in the structural hash). Please keep the CIP and the code in sync;
+> ideally the CIP references a tagged release whose types match the text
+> exactly.
+>
+> Compared to the token standard's
+> [`AnyValue`](https://github.com/canton-network/splice/blob/c3ce39dc56163ad7abd38a66efddd4d844e20026/token-standard/splice-api-token-metadata-v1/daml/Splice/Api/Token/MetadataV1.daml#L14-L25), `AV_RelTime` and `AV_ContractId` are still
+> missing. Contract-ids in particular are useful for on-ledger payloads, e.g.,
+> to point to a contract describing the methodology. The pull path can just
+> reject them in the codec. Conversely, `AVNull` and `AVInstrumentId` are not
+> needed: an absent field and an `AVMap` with `admin` and `id` express the same,
+> and the schema fixes the encoding anyway.
 
 `Values` maps field names to tagged values. Which fields a payload carries, and
 at which tags, is defined by the schema that the publication names.
@@ -244,6 +298,11 @@ interface DistributorKey where
 | `hashMethod` | `"SHA-256"` for the codec defined in this CIP. |
 | `payloadCodec` | The identifier of the envelope the key signs. This CIP defines `v2-datapoint-hash`. Verification refuses a key whose codec it does not implement; `signMethod` and `hashMethod` are descriptive and not checked. |
 
+> REVIEW(SM): I'd either check `signMethod` and `hashMethod` in verification or
+> drop them. Fields that are only descriptive are a trap: implementers will
+> assume they are checked. (Also, the doc comment on `payloadCodec` in the
+> reference implementation still uses `"v2-quote-hash"` as its example.)
+
 Distributors:
 
 - MUST implement the interface only on templates of which `distributor` is a
@@ -257,6 +316,42 @@ Distributors:
 
 Reads are non-consuming, so any number of consumers verify concurrently against
 one key contract without contention.
+
+> REVIEW(SM): please reconsider the single-interface design from my second
+> review ([here](https://github.com/meiersi-da/canton-data-standard/blob/d08268f370a94f29d5ba1bac23682a28fb3ca472/interfaces/canton-data-standard-distributor-key-v1/daml/DataStandard/DistributorKeyV1.daml#L42-L87)). In a nutshell: a single `DatapointProvider`
+> interface whose read choice takes an encoded datapoint (empty for the push
+> path; payload and signature for the pull path) and returns the
+> `DatapointView`. Verification then happens in the distributor's
+> implementation of the interface instead of in the consumer's code.
+>
+> I see the following advantages:
+> * Consumers have a single read path and a single way to reference a datapoint,
+>   `(ContractId DatapointProvider, EncodedDatapoint)`, for both delivery
+>   models. They can't get the verification wrong.
+> * A bug in the verification code is fixed by the distributor upgrading its
+>   implementation using SCU. With the current design, every consumer must
+>   rebuild and redeploy against a fixed `codecs` release, as calls into a
+>   utility package are statically linked. So "A defect in it is fixed by a
+>   codecs release" in the Verification section is true, but hides who has to
+>   act.
+> * The signature scheme, hash and encoding become internal to the distributor,
+>   so `DistributorKeyView` and most of the "Signed envelope" section drop out of
+>   the standard. Distributors can still share the `codecs` library as a
+>   convenience.
+> * The distributor gets a hook to enforce its product rules on-ledger: binding
+>   a payload to a consumer, checking entitlements, or recording usage for
+>   billing. With the current design, signed payloads are bearer tokens: anyone
+>   that gets hold of one can use it until `expiresAt`.
+>
+> Relatedly, I'd follow the token standard pattern of adding
+> `extraArgs : ExtraArgs` to the read choices and implementing them via an
+> interface method, so that distributors can require additional context (e.g.,
+> an entitlement contract) without a new interface version.
+>
+> If you decide to stay with the current design, then please add the
+> single-interface design under "Alternatives considered" in the Rationale,
+> together with the reasons for rejecting it, and state explicitly that signed
+> payloads are bearer data.
 
 ### Signed envelope
 
@@ -325,6 +420,18 @@ root = record [ leaf(p.publishedAt), leaf(p.expiresAt), leaf(p.schemaVersion), h
 **Signature.** The distributor signs with ECDSA on secp256k1, with SHA-256 as
 the digest, over the 32 bytes obtained by hex-decoding `root`. The signature is
 hex-encoded DER. The codec identifier of this envelope is `v2-datapoint-hash`.
+
+> REVIEW(SM): consider adding domain separation to the root hash, e.g., by
+> hashing it as a variant tagged with the codec id `v2-datapoint-hash`. As is,
+> the distributor signs an untagged 32-byte digest, so a signature from any other
+> protocol in which the distributor uses the same secp256k1 key over raw digests
+> could potentially be replayed here, and vice versa. Including the codec id in
+> the signed data also ties the signature to the version of the hash.
+>
+> Relatedly, 0.3.0 extended the hashed domain (new tags `party`, `instrumentId`,
+> `date` and `null`) without changing the codec id. That's fine as long as such
+> changes are pure extensions, but I'd state that rule explicitly in the
+> "Evolution" section.
 
 The structural combinators are those of `Splice.Amulet.CryptoHash`; the
 standard adds the `AnyValue`, `Bool`, `Time` and `TextMap` cases. An
@@ -432,6 +539,20 @@ processes the reading part of each consumer transaction and learns which
 party read which publication or key, and when. It does not see the rest of the
 consumer's transaction.
 
+> REVIEW(SM): I'd call out two more consequences of the distributor being a
+> signatory of the contracts that are read:
+> * The distributor's validator is a confirmer of every consumer transaction
+>   that reads a data point or a key. Its availability and latency thus directly
+>   affect the consumers' transactions, which consumers should take into account
+>   when choosing a distributor.
+> * With the traffic-based app rewards of
+>   [CIP-0104](../cip-0104/cip-0104.md#record-app-activity-based-on-sequencer-and-mediator-data),
+>   a distributor that is a featured app earns app rewards for the traffic of
+>   every transaction it confirms. That's a native monetization mechanism for
+>   data distribution without any payment flow, and an argument for keeping the
+>   requirement to read the `DistributorKey` in the verifying transaction. I'd
+>   mention it in the Motivation.
+
 ### Evolution
 
 Changes to the standard fall into three categories:
@@ -467,6 +588,11 @@ A shared interface makes the read side uniform. Applications integrate once,
 data providers become interchangeable at the level of a party, and tools such
 as indexers, dashboards and cross-checks between providers work across all
 implementations.
+
+> REVIEW(SM): nit: here and above "data providers" is used, while the rest of
+> the CIP uses "distributor". Also, indexers and dashboards only see the
+> publications that they are a stakeholder of or that are disclosed to them,
+> so I'd qualify the claim.
 
 
 ### Use cases
@@ -535,12 +661,25 @@ hierarchies, such as Redstone's CAPS proposal, operate at the product layer.
 Their consumer-facing contracts can implement `PublishedDataPoint`, so that
 applications read them through the standard alongside other distributors.
 
+> REVIEW(SM): the CIP is missing a few sections that recent CIPs have (see,
+> e.g., [CIP-0056](../cip-0056/cip-0056.md) or [CIP-0112](../cip-0112/cip-0112.md)):
+> * "Alternatives considered" as part of the Rationale: in particular the
+>   single-interface design (see my comment on `DistributorKey`), reusing the
+>   token standard's metadata types, and the netting-based billing alternative
+>   to a standardized paid path from my first review.
+> * "Backwards compatibility": how existing data publications on Canton can
+>   adopt the standard, and how the `-v1` packages will co-exist with future
+>   versions (cf. [Section 5 of CIP-0112](../cip-0112/cip-0112.md#5-backwards-compatibility)).
+> * "Changelog" at the end.
+
 
 ## Reference implementation
 
 The reference implementation is
 [kaikodata/canton-data-standard](https://github.com/kaikodata/canton-data-standard),
 release `v0.2.0`, built with Daml SDK 3.4.11 for Daml-LF 2.1. It contains:
+
+> REVIEW(SM): the latest release is `v0.3.0`; see my comment on "Value types".
 
 - the four packages of the standard, with their built DARs committed under
   `dars/`;
